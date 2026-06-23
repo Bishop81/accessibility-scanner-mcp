@@ -136,7 +136,7 @@ function formatReport(s) {
 }
 
 const server = new Server(
-  { name: 'accessibility-scanner', version: '0.1.0' },
+  { name: 'accessibility-scanner', version: '0.1.1' },
   { capabilities: { tools: {} } },
 );
 
