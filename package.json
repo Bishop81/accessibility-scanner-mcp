@@ -1,0 +1,39 @@
+{
+  "name": "accessibility-scanner-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that scans web pages for WCAG accessibility issues with axe-core, so AI agents can audit and fix accessibility. By accessibilityscanner.app",
+  "type": "module",
+  "bin": {
+    "accessibility-scanner-mcp": "server.mjs"
+  },
+  "files": [
+    "server.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "accessibility",
+    "a11y",
+    "wcag",
+    "axe-core",
+    "ai-agent"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axe-core": "^4.12.1",
+    "playwright-core": "^1.61.0"
+  },
+  "license": "MIT",
+  "homepage": "https://accessibilityscanner.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bishop81/accessibility-scanner-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Bishop81/accessibility-scanner-mcp/issues"
+  }
+}
