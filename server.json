@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.bishop81/accessibility-scanner-mcp",
+  "name": "io.github.Bishop81/accessibility-scanner-mcp",
   "description": "Scan any URL for WCAG accessibility issues (axe-core) and get per-element fixes for an AI agent.",
   "repository": {
     "url": "https://github.com/Bishop81/accessibility-scanner-mcp",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.1.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "accessibility-scanner-mcp",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "transport": {
         "type": "stdio"
       },
