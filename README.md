@@ -7,8 +7,12 @@ offending HTML, the specific failure, the WCAG success criterion, and a fix-guid
 items that still need human review.
 
 It runs the real [axe-core](https://github.com/dequelabs/axe-core) engine in your **local Chrome**
-(via `playwright-core`), so nothing about the pages you scan leaves your machine. It also resolves
+(via `playwright-core`), so nothing about the pages you scan leaves your machine. It scrolls the page
+first so **lazy-loaded content is actually checked** rather than silently skipped, and it resolves
 color contrast over CSS gradients, which most tools leave as "needs review."
+
+> **Upgrading from 0.1.x?** 0.2.0 sees more of each page and returns more findings for the same URL.
+> See [CHANGELOG.md](CHANGELOG.md).
 
 Part of [accessibilityscanner.app](https://accessibilityscanner.app).
 
