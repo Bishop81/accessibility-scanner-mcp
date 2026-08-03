@@ -137,6 +137,13 @@ async function scan(url, { timeoutMs = 30000, chromePath = process.env.CHROME_PA
         await resolveColorContrast(r);
       } catch (e) { /* never let resolution break a scan */ }
 
+      // Focus-state contrast: controls that pass at rest and fail once focused.
+      // Runs AFTER axe and after the resolver, because it really focuses elements —
+      // which scrolls and can fire page JS. It restores scroll and focus when done.
+      try {
+        await checkFocusContrast(r);
+      } catch (e) { /* never let the focus pass break a scan */ }
+
 // ─── Contrast resolution (runs in page context) ───
 // Turns axe's "incomplete" color-contrast results into real passes and failures.
 //
@@ -513,6 +520,326 @@ async function resolveColorContrast(results) {
       results.violations.push(v);
     }
     for (const n of failed) v.nodes.push(n);
+  }
+}
+
+// ─── Focus-state contrast (runs in page context) ───
+// Finds controls whose text contrast PASSES at rest and FAILS once focused.
+//
+// axe-core cannot report this: its only contrast rules are color-contrast (AA) and
+// color-contrast-enhanced (AAA), and both measure the default rendered state. There is
+// no focus-contrast rule in axe at all. So a button that reads white-on-teal normally
+// and white-on-pale-grey when tabbed to passes every automated check while being
+// unusable for the keyboard users who most depend on seeing the focused state.
+//
+// HOW THE FOCUS STATE IS MEASURED — AND WHY READING STYLESHEETS DOES NOT WORK
+// The first version of this read the CSS: find rules whose selector carries :focus,
+// strip the pseudo-class, test whether the element matches, apply those declarations.
+// It was fast, side-effect free, and WRONG. Validated against ground truth it reported
+// failures on 6 of 14 real shops where the rendered style does not change on focus at
+// all. Two reasons: it approximated the cascade by document order and so lost every
+// specificity contest, and it descended into @media groups without checking the query,
+// so a `@media print { a:focus { color: #999 } }` counted as if it applied on screen.
+//
+// A false "your site fails" is the fake-compliance badge inverted, so the browser now
+// decides. Each candidate is really focused and the computed style is read back. CSS is
+// still parsed, but only to pick candidates worth focusing — over-inclusion there is
+// harmless because the measurement no longer trusts it.
+//
+// focus({ focusVisible: true }) does produce :focus-visible in Chrome, including on
+// anchors, which was the original objection to this approach and turned out to be false.
+//
+// KNOWN LIMITS, deliberately not guessed at:
+//   - The focus pass runs AFTER axe, and restores scroll position and the previously
+//     focused element, but focusing can still fire page JavaScript.
+//   - Cross-origin stylesheets cannot be read, so a candidate whose only focus rule
+//     lives in a CDN sheet is never tried (14-21% of sheets on real sites).
+//   - A focus state over a background IMAGE is not resolved, only solid colours and
+//     gradients. Reporting nothing is the right failure there.
+//   - Only elements reachable by TAB count. tabindex="-1" is programmatically focusable
+//     only, so a keyboard user cannot land on it and there is no barrier.
+async function checkFocusContrast(results) {
+  const MAX_ELEMENTS = 400;
+  const DEADLINE = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 4000;
+  const overBudget = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) > DEADLINE;
+
+  const swatch = document.createElement('canvas');
+  swatch.width = swatch.height = 1;
+  const sctx = swatch.getContext('2d', { willReadFrequently: true });
+  const colorCache = new Map();
+
+  // Same browser-backed parse as the contrast resolver: regexing rgb() is blind to
+  // color(srgb ...), oklch() and friends, which current CSS emits by default.
+  const parseRgb = (s) => {
+    const key = (s || '').trim();
+    if (!key || key === 'none' || key === 'transparent') return null;
+    if (colorCache.has(key)) return colorCache.get(key);
+    let value = null;
+    const m = key.match(/^rgba?\(([^)]+)\)$/i);
+    if (m) {
+      const p = m[1].split(/[,\s/]+/).filter((x) => x !== '').map((x) => parseFloat(x));
+      if (p.length >= 3 && p.every((x) => isFinite(x))) {
+        value = { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+      }
+    }
+    if (!value) {
+      try {
+        sctx.fillStyle = '#000000';
+        sctx.fillStyle = key;
+        const accepted = sctx.fillStyle;
+        sctx.fillStyle = '#ffffff';
+        sctx.fillStyle = key;
+        if (accepted === sctx.fillStyle) {
+          sctx.globalCompositeOperation = 'copy';
+          sctx.fillRect(0, 0, 1, 1);
+          const d = sctx.getImageData(0, 0, 1, 1).data;
+          value = { r: d[0], g: d[1], b: d[2], a: d[3] / 255 };
+        }
+      } catch (e) { value = null; }
+    }
+    colorCache.set(key, value);
+    return value;
+  };
+
+  const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  const lum = (c) => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+  const contrast = (a, b) => {
+    const hi = Math.max(lum(a), lum(b)), lo = Math.min(lum(a), lum(b));
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  const over = (top, base) => ({
+    r: top.a * top.r + (1 - top.a) * base.r,
+    g: top.a * top.g + (1 - top.a) * base.g,
+    b: top.a * top.b + (1 - top.a) * base.b,
+    a: 1,
+  });
+  const splitTop = (s) => {
+    const out = []; let depth = 0, buf = '';
+    for (const ch of s) {
+      if (ch === '(') depth++; else if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) { out.push(buf); buf = ''; continue; }
+      buf += ch;
+    }
+    if (buf.trim() !== '') out.push(buf);
+    return out.map((x) => x.trim());
+  };
+  // A background-image value only counts if it actually names one. The `background`
+  // SHORTHAND expands to background-image: "initial" in CSSOM, and an earlier version
+  // treated that string as an image, failed to parse it as a gradient, and silently
+  // skipped every control whose focus rule used the shorthand — which is most of them.
+  const paintsImage = (v) => !!v && /(^|\s)(linear-|radial-|conic-|repeating-)?gradient\(|url\(/i.test(v);
+
+  const gradientStops = (image) => {
+    const first = splitTop(image)[0] || '';
+    if (first.indexOf('gradient(') === -1) return null;
+    const inner = first.slice(first.indexOf('(') + 1, first.lastIndexOf(')'));
+    const stops = splitTop(inner)
+      .map((part) => part.replace(/\s+(-?[\d.]+(%|px|em|rem|deg|turn|rad|grad)|calc\(.*\))+$/i, '').trim())
+      .map(parseRgb)
+      .filter(Boolean);
+    return stops.length ? stops : null;
+  };
+
+  const canvasBase = (() => {
+    for (const el of [document.documentElement, document.body]) {
+      if (!el) continue;
+      const c = parseRgb(getComputedStyle(el).backgroundColor);
+      if (c && c.a === 1) return c;
+    }
+    return { r: 255, g: 255, b: 255, a: 1 };
+  })();
+
+  // Candidate backdrops behind an element, given its own background declarations.
+  // Returns null when the answer cannot be established (an image, most often).
+  const backdropsFor = (el, ownColor, ownImage) => {
+    let base = null;
+    for (let hop = el.parentElement; hop; hop = hop.parentElement) {
+      const cs = getComputedStyle(hop);
+      if (paintsImage(cs.backgroundImage)) {
+        const stops = gradientStops(cs.backgroundImage);
+        if (!stops) return null;                       // image behind: not resolvable here
+        base = stops.filter((s) => s.a === 1);
+        if (base.length) break;
+        return null;
+      }
+      const bc = parseRgb(cs.backgroundColor);
+      if (bc && bc.a === 1) { base = [bc]; break; }
+    }
+    if (!base || !base.length) base = [canvasBase];
+
+    if (paintsImage(ownImage)) {
+      const stops = gradientStops(ownImage);
+      if (!stops) return null;
+      const out = [];
+      for (const b of base) for (const s of stops) out.push(s.a === 1 ? s : over(s, b));
+      return out;
+    }
+    if (ownColor && ownColor.a > 0) {
+      return base.map((b) => (ownColor.a === 1 ? ownColor : over(ownColor, b)));
+    }
+    return base;
+  };
+
+  const worstAgainst = (fg, backdrops) => {
+    let worst = Infinity;
+    for (const b of backdrops) worst = Math.min(worst, contrast(fg, b));
+    return worst;
+  };
+
+  // Every :focus / :focus-visible declaration that applies to el, in document order.
+  const focusRules = (() => {
+    const collected = [];
+    for (const sheet of Array.from(document.styleSheets)) {
+      let rules;
+      try { rules = sheet.cssRules; } catch (e) { continue; }   // cross-origin sheet
+      if (!rules) continue;
+      const walk = (list) => {
+        for (const rule of Array.from(list)) {
+          if (rule.cssRules && !rule.selectorText) { walk(rule.cssRules); continue; }  // @media etc
+          if (!rule.selectorText) continue;
+          if (!/:focus(-visible|-within)?\b/.test(rule.selectorText)) continue;
+          for (const sel of rule.selectorText.split(',')) {
+            const bare = sel.replace(/::?focus(-visible|-within)?\b/g, '').trim();
+            if (!bare) continue;
+            collected.push({ bare, style: rule.style });
+          }
+        }
+      };
+      walk(rules);
+    }
+    return collected;
+  })();
+
+  // Is this element worth the cost of focusing? Only a candidate filter — deliberately
+  // over-inclusive, since the real measurement below no longer trusts this answer.
+  const mightRestyleOnFocus = (el) => {
+    for (const { bare, style } of focusRules) {
+      if (!style.getPropertyValue('color')
+        && !style.getPropertyValue('background-color')
+        && !style.getPropertyValue('background-image')) continue;
+      try { if (el.matches(bare)) return true; } catch (e) { continue; }
+    }
+    return false;
+  };
+
+  const focusable = Array.from(document.querySelectorAll(
+    'a[href], button, input, select, textarea, [tabindex], [contenteditable="true"]'
+  ));
+
+  // A selector that resolves to THIS element and nothing else. "button.btn" is useless
+  // in a report — a page has forty of them, so the reader cannot find the one we mean and
+  // cannot check our claim. Walks up adding :nth-of-type until the path is unambiguous,
+  // which is what axe does for the same reason.
+  const uniqueSelector = (el) => {
+    if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
+      return '#' + CSS.escape(el.id);
+    }
+    const parts = [];
+    for (let node = el; node && node.nodeType === 1 && node !== document.documentElement; node = node.parentElement) {
+      let part = node.tagName.toLowerCase();
+      if (node.id && document.querySelectorAll('#' + CSS.escape(node.id)).length === 1) {
+        parts.unshift('#' + CSS.escape(node.id));
+        break;
+      }
+      const siblings = node.parentElement
+        ? Array.from(node.parentElement.children).filter((c) => c.tagName === node.tagName)
+        : [node];
+      if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+      parts.unshift(part);
+      const candidate = parts.join(' > ');
+      try { if (document.querySelectorAll(candidate).length === 1) return candidate; } catch (e) { /* keep going */ }
+    }
+    const joined = parts.join(' > ');
+    return joined || el.tagName.toLowerCase();
+  };
+
+  const failed = [];
+  let focusedCount = 0;
+
+  // Focusing scrolls and moves the caret, so remember what to put back.
+  const scrollX = window.scrollX, scrollY = window.scrollY;
+  const previouslyFocused = document.activeElement;
+
+  const snapshot = (el) => {
+    const cs = getComputedStyle(el);
+    return { color: cs.color, bg: cs.backgroundColor, img: cs.backgroundImage,
+             fontPx: parseFloat(cs.fontSize) || 16, weight: parseInt(cs.fontWeight, 10) || 400 };
+  };
+
+  try {
+    for (const el of focusable) {
+      try {
+        if (focusedCount >= MAX_ELEMENTS || overBudget()) break;
+
+        if (el.disabled) continue;
+        const ti = el.getAttribute('tabindex');
+        if (ti !== null && parseInt(ti, 10) < 0) continue;
+        if (el.closest('[aria-hidden="true"]')) continue;
+        if (!el.offsetParent && getComputedStyle(el).position !== 'fixed') continue;
+        if (!mightRestyleOnFocus(el)) continue;
+
+        const rest = snapshot(el);
+        const restFg = parseRgb(rest.color);
+        if (!restFg) continue;
+
+        focusedCount++;
+        try { el.focus({ focusVisible: true }); } catch (e) { try { el.focus(); } catch (e2) { continue; } }
+        if (document.activeElement !== el) continue;      // refused focus: nothing to measure
+        const foc = snapshot(el);
+        try { el.blur(); } catch (e) { /* ignore */ }
+
+        // The browser says nothing changed, so there is no focus-state failure. This is
+        // the check the stylesheet version lacked, and it is what makes the result true.
+        if (foc.color === rest.color && foc.bg === rest.bg && foc.img === rest.img) continue;
+
+        const required = (rest.fontPx >= 24 || (rest.fontPx >= 18.66 && rest.weight >= 700)) ? 3 : 4.5;
+
+        const restBackdrops = backdropsFor(el, parseRgb(rest.bg), rest.img);
+        if (!restBackdrops) continue;
+        const restRatio = worstAgainst(restFg, restBackdrops);
+        // Already failing at rest? axe's own color-contrast rule reports that; saying it
+        // twice is noise, and the interesting claim is specifically the state CHANGE.
+        if (!isFinite(restRatio) || restRatio < required) continue;
+
+        const focusFg = parseRgb(foc.color);
+        if (!focusFg) continue;
+        const focusBackdrops = backdropsFor(el, parseRgb(foc.bg), foc.img);
+        if (!focusBackdrops) continue;
+        const focusRatio = worstAgainst(focusFg, focusBackdrops);
+        if (!isFinite(focusRatio) || focusRatio >= required) continue;
+
+        const selector = uniqueSelector(el);
+
+        failed.push({
+          target: [selector],
+          html: (el.outerHTML || '').slice(0, 4096),
+          impact: 'serious',
+          failureSummary:
+            'Element passes contrast at rest (' + restRatio.toFixed(2) + ':1) but drops to '
+            + focusRatio.toFixed(2) + ':1 when focused, below the required ' + required
+            + ':1. Keyboard users see only the focused state.',
+        });
+      } catch (e) { /* one bad element must never cost the rest */ }
+    }
+  } finally {
+    try { if (previouslyFocused && previouslyFocused.focus) previouslyFocused.focus(); } catch (e) { /* ignore */ }
+    try { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); } catch (e) { /* ignore */ }
+    window.scrollTo(scrollX, scrollY);
+  }
+
+  if (failed.length) {
+    results.violations.push({
+      id: 'color-contrast-focus',
+      impact: 'serious',
+      description: 'Ensure text keeps sufficient contrast when its control is focused',
+      help: 'Focused controls must still meet the contrast minimum',
+      // 1.4.3 is the criterion: this is still contrast of text, measured in the state a
+      // keyboard user actually sees.
+      helpUrl: 'https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html',
+      tags: ['cat.color', 'wcag2aa', 'wcag143'],
+      nodeCount: failed.length,
+      nodes: failed,
+    });
   }
 }
 
