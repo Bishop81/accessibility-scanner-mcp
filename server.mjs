@@ -153,7 +153,8 @@ async function scan(url, { timeoutMs = 30000, chromePath = process.env.CHROME_PA
 // marketing sites it is most of the contrast findings.
 //
 // Three sources of backdrop are resolved here:
-//   gradient — fully defined by its colour stops, so the worst case is at a stop.
+//   gradient — its colour stops AND the colours the browser mixes between them. The
+//              worst case is not always at a stop; see "Gradients" below.
 //   image    — rasterised to a canvas and sampled underneath the text.
 //   overlay  — translucent layers composited over whatever is beneath them, which
 //              is how a scrim over a hero photo actually renders.
@@ -259,6 +260,124 @@ async function resolveColorContrast(results) {
     a: 1,
   });
 
+  // GRADIENTS: SAMPLE BETWEEN THE STOPS, NOT ONLY AT THEM (revision 5)
+  // Revisions 3 and 4 measured a gradient only at its colour stops, on the premise that
+  // the worst case must sit at one. It need not. Two colours mixed in sRGB can pass
+  // through a darker middle: black text on linear-gradient(#ff0000, #00c800) measures
+  // 5.25:1 and 9.26:1 at the stops but 3.49:1 about 37% along, and was reported as a
+  // pass. Light text is safe from this (luminance along an sRGB segment is convex, so
+  // its maximum is at a stop); dark text is not, because the minimum can fall between.
+  //
+  // So each segment is sampled the way the browser paints it, with premultiplied alpha:
+  //   - in the space the gradient names ("in srgb", "in srgb-linear", "in oklab");
+  //   - otherwise sRGB when every stop uses legacy syntax (hex, rgb(), hsl(), keywords),
+  //     and Oklab when any stop uses CSS Color 4 syntax, per CSS Images 4;
+  //   - hue spaces (hsl, hwb, lch, oklch) and anything else unmodelled stay "needs
+  //     review", as does a gradient with any stop that will not parse. Dropping a stop
+  //     silently could remove the very colour the text fails against.
+  // A hard edge (two adjacent stops at the same position) paints nothing between them,
+  // so nothing is sampled there; sampling it would invent a colour and a false failure.
+  const SEGMENT_SAMPLES = 48;
+  const POSITION = /^(-?(\d+\.?\d*|\.\d+)(%|[a-z]+)?|calc\(.*\))$/i;
+  const splitSpaces = (s) => {
+    const out = [];
+    let depth = 0, buf = '';
+    for (const ch of s) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      if (depth === 0 && /\s/.test(ch)) { if (buf !== '') out.push(buf); buf = ''; continue; }
+      buf += ch;
+    }
+    if (buf !== '') out.push(buf);
+    return out;
+  };
+  const toLinear = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  const fromLinear = (c) => 255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+  const toSpace = (c, space) => {
+    if (space === 'srgb') return [c.r, c.g, c.b];
+    const r = toLinear(c.r), g = toLinear(c.g), b = toLinear(c.b);
+    if (space === 'srgb-linear') return [r, g, b];
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    return [
+      0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+      1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+      0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ];
+  };
+  const fromSpace = (v, space) => {
+    const k = (x) => Math.min(255, Math.max(0, x));
+    if (space === 'srgb') return { r: k(v[0]), g: k(v[1]), b: k(v[2]) };
+    let lin3 = v;
+    if (space === 'oklab') {
+      const l = (v[0] + 0.3963377774 * v[1] + 0.2158037573 * v[2]) ** 3;
+      const m = (v[0] - 0.1055613458 * v[1] - 0.0638541728 * v[2]) ** 3;
+      const s = (v[0] - 0.0894841775 * v[1] - 1.2914855480 * v[2]) ** 3;
+      lin3 = [
+        4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+      ];
+    }
+    return { r: k(fromLinear(lin3[0])), g: k(fromLinear(lin3[1])), b: k(fromLinear(lin3[2])) };
+  };
+  const mix = (a, b, t, space) => {
+    const alpha = a.a + (b.a - a.a) * t;
+    if (alpha <= 0) return { r: 0, g: 0, b: 0, a: 0 };
+    const pa = toSpace(a, space), pb = toSpace(b, space);
+    const v = [0, 1, 2].map((i) => (pa[i] * a.a + (pb[i] * b.a - pa[i] * a.a) * t) / alpha);
+    const out = fromSpace(v, space);
+    out.a = alpha;
+    return out;
+  };
+  const hardEdge = (p, q) => {
+    const a = (p || '').match(/^(-?[\d.]+)([a-z%]*)$/i), b = (q || '').match(/^(-?[\d.]+)([a-z%]*)$/i);
+    return !!(a && b && a[2].toLowerCase() === b[2].toLowerCase() && parseFloat(b[1]) <= parseFloat(a[1]));
+  };
+  // Stops (colours) and samples for one gradient layer, or null when either the stops
+  // or the interpolation space cannot be established.
+  const gradientCache = new Map();
+  const gradientLayer = (layer) => {
+    if (gradientCache.has(layer)) return gradientCache.get(layer);
+    let value = null;
+    const parts = splitTop(layer.slice(layer.indexOf('(') + 1, layer.lastIndexOf(')')));
+    let prelude = '';
+    const stops = [];
+    let readable = true;
+    for (let i = 0; i < parts.length && readable; i++) {
+      const tokens = splitSpaces(parts[i]);
+      if (tokens.length === 1 && POSITION.test(tokens[0])) continue;   // colour hint, or a bare angle
+      const positions = [];
+      while (tokens.length > 1 && POSITION.test(tokens[tokens.length - 1])) positions.unshift(tokens.pop());
+      const token = tokens.join(' ');
+      const c = parseRgb(token);
+      if (c) {
+        for (const p of positions.length ? positions : [null]) stops.push({ c, token, pos: p });
+      } else if (i === 0 && token.indexOf('(') === -1) {
+        prelude = parts[i];                      // "to right", "circle at 50% 50%", "90deg in oklab"
+      } else {
+        readable = false;
+      }
+    }
+    if (readable && stops.length) {
+      const named = prelude.match(/\bin\s+([a-z0-9-]+)/i);
+      const legacy = stops.every((s) => /^(#|rgba?\(|hsla?\(|[a-z]+$)/i.test(s.token));
+      const space = named ? named[1].toLowerCase() : legacy ? 'srgb' : 'oklab';
+      if (space === 'srgb' || space === 'srgb-linear' || space === 'oklab') {
+        const samples = [];
+        for (let i = 0; i < stops.length; i++) {
+          samples.push(stops[i].c);
+          if (i === stops.length - 1 || hardEdge(stops[i].pos, stops[i + 1].pos)) continue;
+          for (let k = 1; k < SEGMENT_SAMPLES; k++) samples.push(mix(stops[i].c, stops[i + 1].c, k / SEGMENT_SAMPLES, space));
+        }
+        value = { stops: stops.map((s) => s.c), samples };
+      }
+    }
+    gradientCache.set(layer, value);
+    return value;
+  };
+
   // What the browser actually paints where nothing else is: html, then body, else white.
   const canvasBase = (() => {
     for (const el of [document.documentElement, document.body]) {
@@ -324,16 +443,9 @@ async function resolveColorContrast(results) {
         // that are not worth guessing at.
         const first = splitTop(image)[0];
         if (first.indexOf('gradient(') !== -1) {
-          // Inside the parens: a direction/shape token, then colour stops each with an
-          // optional position. Strip positions, keep whatever resolves to a colour.
-          const open = first.indexOf('(');
-          const inner = first.slice(open + 1, first.lastIndexOf(')'));
-          const stops = splitTop(inner)
-            .map((part) => part.replace(/\s+(-?[\d.]+(%|px|em|rem|deg|turn|rad|grad)|calc\(.*\))+$/i, '').trim())
-            .map(parseRgb)
-            .filter(Boolean);
-          if (!stops.length) return null;
-          out.push({ kind: 'gradient', stops });
+          const g = gradientLayer(first);
+          if (!g) return null;
+          out.push({ kind: 'gradient', stops: g.stops, samples: g.samples });
         } else {
           // background-attachment: fixed anchors the image to the viewport, so an
           // element's own box no longer tells us which part of it sits behind the text.
@@ -380,7 +492,7 @@ async function resolveColorContrast(results) {
       if (layer.kind === 'gradient') {
         const next = [];
         for (const b of base) {
-          for (const s of layer.stops) next.push(s.a === 1 ? s : over(s, b));
+          for (const s of layer.samples) next.push(s.a === 1 ? s : over(s, b));
         }
         base = next;
         continue;
