@@ -144,50 +144,31 @@ async function scan(url, { timeoutMs = 30000, chromePath = process.env.CHROME_PA
         await checkFocusContrast(r);
       } catch (e) { /* never let the focus pass break a scan */ }
 
-// ─── Contrast resolution (runs in page context) ───
-// Turns axe's "incomplete" color-contrast results into real passes and failures.
+// ─── Gradient sampling (runs in page context) ───
+// Colour stops of a CSS gradient AND the colours the browser paints between them,
+// shared by resolveColorContrast and checkFocusContrast so the two can never disagree
+// about what a gradient means. Both call it as `gradientSampling(parseRgb)`, passing
+// their own browser-backed colour parser.
 //
-// axe gives up whenever it cannot know the backdrop from CSS alone: a gradient, a
-// background image, or a translucent layer over either. That is honest of it, but
-// "needs review" is the least useful thing we can tell someone, and on image-heavy
-// marketing sites it is most of the contrast findings.
+// Two colours mixed in sRGB can pass through a darker middle: black text on
+// linear-gradient(#ff0000, #00c800) measures 5.25:1 and 9.26:1 at the stops but 3.49:1
+// about 37% along, and stop-only checking called that a pass. Light text is safe from
+// this (luminance along an sRGB segment is convex, so its maximum is at a stop); dark
+// text is not, because the minimum can fall between.
 //
-// Three sources of backdrop are resolved here:
-//   gradient — its colour stops AND the colours the browser mixes between them. The
-//              worst case is not always at a stop; see "Gradients" below.
-//   image    — rasterised to a canvas and sampled underneath the text.
-//   overlay  — translucent layers composited over whatever is beneath them, which
-//              is how a scrim over a hero photo actually renders.
-//
-// The worst case across every sample decides, matching how the gradient path already
-// worked: a heading that is legible over the light end of a photo and invisible over
-// the dark end is a real failure, and reporting the average would hide it.
-//
-// WHERE THIS STILL BAILS, AND WHY THAT IS DELIBERATE
-// A sample can be wrong in two directions, and only one of them is acceptable. Saying
-// "needs review" when we could have decided is a missed opportunity; saying "passes"
-// when the text is unreadable is the fake-compliance badge this product exists to
-// argue against. So anything not confidently derivable stays incomplete: cross-origin
-// images that taint the canvas, background-attachment: fixed, exotic background-size
-// or repeat keywords, images with no intrinsic size, and any decode failure.
-async function resolveColorContrast(results) {
-  const ci = results.incomplete.findIndex((r) => r.id === 'color-contrast');
-  if (ci === -1) return;
-  const entry = results.incomplete[ci];
-
-  const DEADLINE = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 6000;   // must leave room inside process_timeout_margin
-  // A backstop against a pathological page, not the real limiter — the time budget is.
-  // 40 was too low: our own homepage has 54 flagged nodes, so the cap silently left 14
-  // unresolved that the resolver could have decided. Gradient-only nodes need no async
-  // work at all, and rasters are cached per URL, so the common case is cheap.
-  const MAX_NODES = 500;
-  const GRID = 7;                // 49 samples per node is plenty to find a worst case
-  const overBudget = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) > DEADLINE;
-
-  // Split on commas that are NOT inside parentheses. A naive split tears
-  // "radial-gradient(120% 80% at 50% -10%, color(srgb ...), ...)" apart at its first
-  // internal comma, which silently produced zero colour stops and made every gradient
-  // on a modern site fall back to "needs review".
+// Each segment is sampled the way the browser paints it, with premultiplied alpha:
+//   - in the space the gradient names ("in srgb", "in srgb-linear", "in oklab");
+//   - otherwise sRGB when every stop uses legacy syntax (hex, rgb(), hsl(), keywords),
+//     and Oklab when any stop uses CSS Color 4 syntax, per CSS Images 4;
+//   - hue spaces (hsl, hwb, lch, oklch) and anything else unmodelled return null, as
+//     does a gradient with any stop that will not parse. Dropping a stop silently could
+//     remove the very colour the text fails against. Callers treat null as unmeasurable:
+//     the resolver leaves the finding as "needs review", the focus check reports nothing.
+// A hard edge (two adjacent stops at the same position) paints nothing between them,
+// so nothing is sampled there; sampling it would invent a colour and a false failure.
+function gradientSampling(parseRgb) {
+  // Commas outside parentheses only: a naive split tears
+  // "radial-gradient(120% 80% at 50% -10%, color(srgb ...), ...)" at its first inner comma.
   const splitTop = (s) => {
     const out = [];
     let depth = 0, buf = '';
@@ -200,67 +181,8 @@ async function resolveColorContrast(results) {
     if (buf.trim() !== '') out.push(buf);
     return out.map((x) => x.trim());
   };
-
-  // Let the browser resolve colour tokens instead of pattern-matching them.
-  // Regexing rgb()/rgba() misses every modern syntax — color(srgb ...), oklch(), lab(),
-  // hwb(), color-mix() — and Tailwind v4 emits those by default, so the previous parser
-  // was blind to the gradients on most current sites. Painting one pixel handles any
-  // syntax the engine itself understands, now and later.
-  const swatch = document.createElement('canvas');
-  swatch.width = swatch.height = 1;
-  const swatchCtx = swatch.getContext('2d', { willReadFrequently: true });
-  const colorCache = new Map();
-  const parseRgb = (s) => {
-    const key = (s || '').trim();
-    if (!key || key === 'none') return null;
-    if (colorCache.has(key)) return colorCache.get(key);
-
-    let value = null;
-    // Fast path: plain rgb()/rgba() is the overwhelmingly common case.
-    const m = key.match(/^rgba?\(([^)]+)\)$/i);
-    if (m) {
-      const p = m[1].split(/[,\s/]+/).filter((x) => x !== '').map((x) => parseFloat(x));
-      if (p.length >= 3 && p.every((x) => isFinite(x))) {
-        value = { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
-      }
-    }
-    if (!value) {
-      try {
-        // fillStyle silently ignores an invalid value, so prove it took by using a
-        // sentinel that the token cannot itself be.
-        swatchCtx.fillStyle = '#000000';
-        swatchCtx.fillStyle = key;
-        const accepted = swatchCtx.fillStyle;
-        swatchCtx.fillStyle = '#ffffff';
-        swatchCtx.fillStyle = key;
-        if (accepted === swatchCtx.fillStyle) {
-          swatchCtx.globalCompositeOperation = 'copy';   // no blend with what was there
-          swatchCtx.fillRect(0, 0, 1, 1);
-          const d = swatchCtx.getImageData(0, 0, 1, 1).data;
-          value = { r: d[0], g: d[1], b: d[2], a: d[3] / 255 };
-        }
-      } catch (e) {
-        value = null;
-      }
-    }
-    colorCache.set(key, value);
-    return value;
-  };
-  const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
-  const lum = (c) => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-  const contrast = (a, b) => {
-    const hi = Math.max(lum(a), lum(b)), lo = Math.min(lum(a), lum(b));
-    return (hi + 0.05) / (lo + 0.05);
-  };
-  // Source-over: place `top` (possibly translucent) on an opaque `base`.
-  const over = (top, base) => ({
-    r: top.a * top.r + (1 - top.a) * base.r,
-    g: top.a * top.g + (1 - top.a) * base.g,
-    b: top.a * top.b + (1 - top.a) * base.b,
-    a: 1,
-  });
-
-  // GRADIENTS: SAMPLE BETWEEN THE STOPS, NOT ONLY AT THEM (revision 5)
+  // Revisions 3-4 measured a gradient only at its colour stops, on the premise that
+  // the worst case must sit at one. It need not.
   // Revisions 3 and 4 measured a gradient only at its colour stops, on the premise that
   // the worst case must sit at one. It need not. Two colours mixed in sRGB can pass
   // through a darker middle: black text on linear-gradient(#ff0000, #00c800) measures
@@ -377,6 +299,125 @@ async function resolveColorContrast(results) {
     gradientCache.set(layer, value);
     return value;
   };
+  return { gradientLayer };
+}
+// ─── Contrast resolution (runs in page context) ───
+// Turns axe's "incomplete" color-contrast results into real passes and failures.
+//
+// axe gives up whenever it cannot know the backdrop from CSS alone: a gradient, a
+// background image, or a translucent layer over either. That is honest of it, but
+// "needs review" is the least useful thing we can tell someone, and on image-heavy
+// marketing sites it is most of the contrast findings.
+//
+// Three sources of backdrop are resolved here:
+//   gradient — its colour stops AND the colours the browser mixes between them. The
+//              worst case is not always at a stop; see "Gradients" below.
+//   image    — rasterised to a canvas and sampled underneath the text.
+//   overlay  — translucent layers composited over whatever is beneath them, which
+//              is how a scrim over a hero photo actually renders.
+//
+// The worst case across every sample decides, matching how the gradient path already
+// worked: a heading that is legible over the light end of a photo and invisible over
+// the dark end is a real failure, and reporting the average would hide it.
+//
+// WHERE THIS STILL BAILS, AND WHY THAT IS DELIBERATE
+// A sample can be wrong in two directions, and only one of them is acceptable. Saying
+// "needs review" when we could have decided is a missed opportunity; saying "passes"
+// when the text is unreadable is the fake-compliance badge this product exists to
+// argue against. So anything not confidently derivable stays incomplete: cross-origin
+// images that taint the canvas, background-attachment: fixed, exotic background-size
+// or repeat keywords, images with no intrinsic size, and any decode failure.
+async function resolveColorContrast(results) {
+  const ci = results.incomplete.findIndex((r) => r.id === 'color-contrast');
+  if (ci === -1) return;
+  const entry = results.incomplete[ci];
+
+  const DEADLINE = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 6000;   // must leave room inside process_timeout_margin
+  // A backstop against a pathological page, not the real limiter — the time budget is.
+  // 40 was too low: our own homepage has 54 flagged nodes, so the cap silently left 14
+  // unresolved that the resolver could have decided. Gradient-only nodes need no async
+  // work at all, and rasters are cached per URL, so the common case is cheap.
+  const MAX_NODES = 500;
+  const GRID = 7;                // 49 samples per node is plenty to find a worst case
+  const overBudget = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) > DEADLINE;
+
+  // Split on commas that are NOT inside parentheses. A naive split tears
+  // "radial-gradient(120% 80% at 50% -10%, color(srgb ...), ...)" apart at its first
+  // internal comma, which silently produced zero colour stops and made every gradient
+  // on a modern site fall back to "needs review".
+  const splitTop = (s) => {
+    const out = [];
+    let depth = 0, buf = '';
+    for (const ch of s) {
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) { out.push(buf); buf = ''; continue; }
+      buf += ch;
+    }
+    if (buf.trim() !== '') out.push(buf);
+    return out.map((x) => x.trim());
+  };
+
+  // Let the browser resolve colour tokens instead of pattern-matching them.
+  // Regexing rgb()/rgba() misses every modern syntax — color(srgb ...), oklch(), lab(),
+  // hwb(), color-mix() — and Tailwind v4 emits those by default, so the previous parser
+  // was blind to the gradients on most current sites. Painting one pixel handles any
+  // syntax the engine itself understands, now and later.
+  const swatch = document.createElement('canvas');
+  swatch.width = swatch.height = 1;
+  const swatchCtx = swatch.getContext('2d', { willReadFrequently: true });
+  const colorCache = new Map();
+  const parseRgb = (s) => {
+    const key = (s || '').trim();
+    if (!key || key === 'none') return null;
+    if (colorCache.has(key)) return colorCache.get(key);
+
+    let value = null;
+    // Fast path: plain rgb()/rgba() is the overwhelmingly common case.
+    const m = key.match(/^rgba?\(([^)]+)\)$/i);
+    if (m) {
+      const p = m[1].split(/[,\s/]+/).filter((x) => x !== '').map((x) => parseFloat(x));
+      if (p.length >= 3 && p.every((x) => isFinite(x))) {
+        value = { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+      }
+    }
+    if (!value) {
+      try {
+        // fillStyle silently ignores an invalid value, so prove it took by using a
+        // sentinel that the token cannot itself be.
+        swatchCtx.fillStyle = '#000000';
+        swatchCtx.fillStyle = key;
+        const accepted = swatchCtx.fillStyle;
+        swatchCtx.fillStyle = '#ffffff';
+        swatchCtx.fillStyle = key;
+        if (accepted === swatchCtx.fillStyle) {
+          swatchCtx.globalCompositeOperation = 'copy';   // no blend with what was there
+          swatchCtx.fillRect(0, 0, 1, 1);
+          const d = swatchCtx.getImageData(0, 0, 1, 1).data;
+          value = { r: d[0], g: d[1], b: d[2], a: d[3] / 255 };
+        }
+      } catch (e) {
+        value = null;
+      }
+    }
+    colorCache.set(key, value);
+    return value;
+  };
+  const lin = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  const lum = (c) => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+  const contrast = (a, b) => {
+    const hi = Math.max(lum(a), lum(b)), lo = Math.min(lum(a), lum(b));
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  // Source-over: place `top` (possibly translucent) on an opaque `base`.
+  const over = (top, base) => ({
+    r: top.a * top.r + (1 - top.a) * base.r,
+    g: top.a * top.g + (1 - top.a) * base.g,
+    b: top.a * top.b + (1 - top.a) * base.b,
+    a: 1,
+  });
+
+  const { gradientLayer } = gradientSampling(parseRgb);
 
   // What the browser actually paints where nothing else is: html, then body, else white.
   const canvasBase = (() => {
@@ -741,16 +782,19 @@ async function checkFocusContrast(results) {
   // skipped every control whose focus rule used the shorthand — which is most of them.
   const paintsImage = (v) => !!v && /(^|\s)(linear-|radial-|conic-|repeating-)?gradient\(|url\(/i.test(v);
 
-  const gradientStops = (image) => {
+  // The same gradient treatment the contrast resolver uses: every stop plus the colours
+  // painted between them. Returns null when the gradient cannot be measured, and this
+  // check reports only failures, so null means "say nothing about this control".
+  const { gradientLayer } = gradientSampling(parseRgb);
+  const gradientColours = (image) => {
     const first = splitTop(image)[0] || '';
     if (first.indexOf('gradient(') === -1) return null;
-    const inner = first.slice(first.indexOf('(') + 1, first.lastIndexOf(')'));
-    const stops = splitTop(inner)
-      .map((part) => part.replace(/\s+(-?[\d.]+(%|px|em|rem|deg|turn|rad|grad)|calc\(.*\))+$/i, '').trim())
-      .map(parseRgb)
-      .filter(Boolean);
-    return stops.length ? stops : null;
+    const g = gradientLayer(first);
+    return g ? g.samples : null;
   };
+  // Focusing runs inside a 4s budget, so refuse a combination big enough to blow it
+  // rather than spend the whole budget on one control.
+  const COMBINATION_CAP = 20000;
 
   const canvasBase = (() => {
     for (const el of [document.documentElement, document.body]) {
@@ -768,9 +812,9 @@ async function checkFocusContrast(results) {
     for (let hop = el.parentElement; hop; hop = hop.parentElement) {
       const cs = getComputedStyle(hop);
       if (paintsImage(cs.backgroundImage)) {
-        const stops = gradientStops(cs.backgroundImage);
-        if (!stops) return null;                       // image behind: not resolvable here
-        base = stops.filter((s) => s.a === 1);
+        const colours = gradientColours(cs.backgroundImage);
+        if (!colours) return null;                     // an image, or a gradient we cannot read
+        base = colours.filter((s) => s.a === 1);
         if (base.length) break;
         return null;
       }
@@ -780,10 +824,11 @@ async function checkFocusContrast(results) {
     if (!base || !base.length) base = [canvasBase];
 
     if (paintsImage(ownImage)) {
-      const stops = gradientStops(ownImage);
-      if (!stops) return null;
+      const colours = gradientColours(ownImage);
+      if (!colours) return null;
+      if (base.length * colours.length > COMBINATION_CAP) return null;
       const out = [];
-      for (const b of base) for (const s of stops) out.push(s.a === 1 ? s : over(s, b));
+      for (const b of base) for (const s of colours) out.push(s.a === 1 ? s : over(s, b));
       return out;
     }
     if (ownColor && ownColor.a > 0) {
