@@ -19,7 +19,25 @@ Part of [accessibilityscanner.app](https://accessibilityscanner.app).
 ## Requirements
 
 - Node.js 18+
-- Google Chrome installed (or set the `CHROME_PATH` environment variable to a Chromium binary)
+- **A Chromium-based browser**: Chrome, Chromium or Edge, found automatically in that order.
+  Set `CHROME_PATH` to point at a specific binary if you'd rather choose. A browser already
+  installed by Playwright is used as a last resort; nothing is ever downloaded for you.
+
+### Or no browser at all
+
+Set `SCANNER_API_URL` and the scan runs on accessibilityscanner.app instead of locally:
+
+```json
+{ "env": { "SCANNER_API_URL": "https://accessibilityscanner.app" } }
+```
+
+No account or key needed — it uses the same public endpoints the website's own form uses.
+Useful in CI, in a container, or anywhere you can't install a browser. Hosted scans also
+carry **suggested fix colours** for contrast failures, which the local scanner doesn't
+compute yet.
+
+⚠️ In this mode the URL you scan is sent to our server. The local path sends nothing
+anywhere, and stays the default — hosted mode is opt-in via that environment variable only.
 
 ## Install
 

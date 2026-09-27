@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // MCP server: exposes an accessibility scan tool so an AI agent can audit a web page
 // (axe-core, WCAG 2.2 A & AA) and get per-element selectors + fixes, ready to act on.
-// Runs locally using your system Chrome via playwright-core. By accessibilityscanner.app.
+// Runs locally using your system Chrome, Chromium or Edge via playwright-core, or against
+// accessibilityscanner.app when SCANNER_API_URL is set. By accessibilityscanner.app.
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -93,19 +94,138 @@ async function settlePage(options) {
   }
 }
 
+// ─── Hosted mode (no local browser) ───
+//
+// With SCANNER_API_URL set, the scan runs on accessibilityscanner.app instead of in a
+// local browser. Two reasons this exists, and the second is the one that forced it:
+//
+//  1. Plenty of environments have no browser and cannot install one — CI containers,
+//     locked-down machines, and MCP hosting platforms. Glama reports this server as
+//     "cannot be deployed" for exactly that reason, which blocks the listing.
+//  2. The hosted scanner is the same engine, so the findings match what the website
+//     would show for the same URL.
+//
+// It needs no credentials, because it calls the same public endpoints the website's own
+// form uses. A token is accepted for higher rate limits once that exists, and is simply
+// omitted until then.
+//
+// ⚠️ This sends the URL to our server. The local path sends nothing anywhere, which is
+// the product's default and stays the default — hosted mode is opt-in via env var only.
+const API_POLL_MS = 2000;
+
+async function scanViaApi(url, base, token = '') {
+  const root = base.replace(/\/+$/, '');
+  const headers = { 'content-type': 'application/json', accept: 'application/json' };
+  if (token) headers.authorization = `Bearer ${token}`;
+
+  const submit = await fetch(`${root}/api/scan`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ url }),
+  });
+  if (!submit.ok) {
+    const body = await submit.text().catch(() => '');
+    throw new Error(`The scan API refused the request (HTTP ${submit.status}). ${body.slice(0, 200)}`);
+  }
+  const queued = await submit.json();
+  if (!queued?.uuid) throw new Error('The scan API accepted the request but returned no scan id.');
+
+  // The queue is shared, so waiting is normal rather than a fault. Bounded, and the
+  // timeout says what to do next instead of just giving up.
+  const deadline = Date.now() + 180000;
+  let report = queued;
+  while (report.status === 'queued' || report.status === 'processing') {
+    if (Date.now() > deadline) {
+      throw new Error(`The scan is still ${report.status} after 3 minutes. It will finish on its own — see ${report.report_url || root}.`);
+    }
+    await new Promise((r) => setTimeout(r, API_POLL_MS));
+    const poll = await fetch(`${root}/api/scan/${report.uuid}`, { headers });
+    if (!poll.ok) throw new Error(`Polling the scan failed (HTTP ${poll.status}).`);
+    report = await poll.json();
+  }
+
+  if (report.status === 'failed') {
+    throw new Error(`The hosted scan failed: ${report.error || 'no reason given'}`);
+  }
+
+  // Reshape into exactly what the local path returns, so formatReport stays one function
+  // and the two modes cannot drift into printing different things.
+  const shape = (findings) => findings.map((f) => ({
+    rule: f.rule,
+    impact: f.impact || 'minor',
+    help: f.help,
+    helpUrl: f.help_url,
+    wcag: f.wcag_criteria || [],
+    elementCount: f.node_count,
+    elements: (f.nodes || []).slice(0, 25).map((n) => ({
+      selector: Array.isArray(n.target) ? n.target.join(' ') : String(n.target ?? ''),
+      html: (n.html || '').slice(0, 300),
+      issue: (n.failureSummary || '').replace(/^Fix (any|all) of the following:\s*/i, '').trim(),
+      fix: n.contrast?.fix ?? null,
+    })),
+  }));
+
+  const all = report.findings || [];
+  return {
+    url: report.summary?.final_url || report.url || url,
+    httpStatus: report.summary?.http_status ?? null,
+    violations: shape(all.filter((f) => f.type === 'violation')),
+    needsReview: shape(all.filter((f) => f.type === 'needs_review')),
+    passes: report.summary?.pass_count ?? 0,
+    engine: report.summary?.engine ?? null,
+  };
+}
+
+const LAUNCH_ARGS = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
+
+/**
+ * Find a browser to drive, in order of preference.
+ *
+ * `playwright-core` deliberately ships no browsers, and the first version of this asked
+ * for `channel: 'chrome'` and nothing else. That meant a machine with Chromium or Edge
+ * but not Google Chrome — an ordinary Linux desktop, or any container — failed outright
+ * with "Install Google Chrome", which was both wrong and unhelpful: a perfectly good
+ * browser was sitting there.
+ *
+ * Order matters. An explicit CHROME_PATH is an instruction, so it is never silently
+ * overridden; if it is set and cannot launch, that is an error rather than a reason to go
+ * hunting. After that, real Chrome first (what the scanner is calibrated against), then
+ * the other Chromium channels, then a Playwright-managed download if one happens to be
+ * on the machine already. We never download anything ourselves — a scan request is not
+ * consent to pull 150MB.
+ */
+async function launchBrowser(chromePath) {
+  if (chromePath) {
+    try {
+      return await chromium.launch({ executablePath: chromePath, args: LAUNCH_ARGS });
+    } catch (e) {
+      throw new Error(`CHROME_PATH is set to "${chromePath}" but Chrome could not be launched there. (${e?.message || e})`);
+    }
+  }
+
+  const attempts = [];
+  // 'chromium' covers a Playwright-managed download; passing no channel at all is what
+  // selects it, which is why the last attempt looks empty.
+  for (const channel of ['chrome', 'msedge', 'chromium', null]) {
+    try {
+      return await chromium.launch({ ...(channel ? { channel } : {}), args: LAUNCH_ARGS });
+    } catch (e) {
+      attempts.push(`${channel ?? 'bundled chromium'}: ${(e?.message || String(e)).split('\n')[0]}`);
+    }
+  }
+
+  throw new Error(
+    'No browser could be launched. Install Google Chrome, Chromium or Edge, or set CHROME_PATH ' +
+    'to a Chromium-based binary. To use a Playwright-managed browser instead, run ' +
+    '"npx playwright install chromium". Alternatively set SCANNER_API_URL to scan via ' +
+    'accessibilityscanner.app with no local browser at all.\nTried — ' + attempts.join(' | '),
+  );
+}
+
 async function scan(url, { timeoutMs = 30000, chromePath = process.env.CHROME_PATH || '' } = {}) {
   if (!/^https?:\/\//i.test(url)) throw new Error('A valid http(s) URL is required.');
 
-  let browser;
-  try {
-    browser = await chromium.launch({
-      executablePath: chromePath || undefined,
-      channel: chromePath ? undefined : 'chrome',
-      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    });
-  } catch (e) {
-    throw new Error(`Could not launch Chrome. Install Google Chrome or set CHROME_PATH. (${e?.message || e})`);
-  }
+  const browser = await launchBrowser(chromePath);
 
   try {
     const ctx = await browser.newContext({
@@ -1044,6 +1164,13 @@ function formatReport(s) {
         lines.push(`- selector: \`${el.selector}\``);
         if (el.html) lines.push(`  html: \`${el.html.replace(/`/g, "'")}\``);
         if (el.issue) lines.push(`  issue: ${el.issue.replace(/\n+/g, ' ')}`);
+        // Only hosted mode carries this today; the local scanner does not compute it yet.
+        // An agent acting on the report wants the colour, not just the failing ratio.
+        const f = el.fix;
+        if (f?.recommended && f[f.recommended]?.hex) {
+          const side = f.recommended;
+          lines.push(`  fix: change the ${side} to ${f[side].hex} → ${f[side].ratio}:1 (needs ${f.required}:1, currently ${f.current}:1)`);
+        }
       }
       if (v.elementCount > v.elements.length) lines.push(`  (+${v.elementCount - v.elements.length} more element(s))`);
     }
@@ -1069,8 +1196,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         'Scan a web page for WCAG 2.2 (A & AA) accessibility issues using axe-core in a real browser. ' +
         'Returns violations grouped by severity, each with the exact element selector, the offending HTML, the ' +
         'specific failure, the WCAG success criterion, and a fix-guide link — ready to act on. Also lists items ' +
-        'that need manual human review. Use this to audit a page and then fix the issues. Requires Google Chrome ' +
-        'installed locally (or set the CHROME_PATH environment variable).',
+        'that need manual human review. Use this to audit a page and then fix the issues. Needs a local ' +
+        'Chromium-based browser (Chrome, Chromium or Edge; or set CHROME_PATH), or set SCANNER_API_URL ' +
+        'to scan via accessibilityscanner.app with no local browser.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1087,8 +1215,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     throw new Error(`Unknown tool: ${request.params.name}`);
   }
   const url = request.params.arguments?.url;
+  const apiBase = process.env.SCANNER_API_URL || '';
   try {
-    const result = await scan(String(url));
+    const result = apiBase
+      ? await scanViaApi(String(url), apiBase, process.env.SCANNER_API_TOKEN || '')
+      : await scan(String(url));
     return { content: [{ type: 'text', text: formatReport(result) }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `Scan failed: ${e?.message || e}` }], isError: true };

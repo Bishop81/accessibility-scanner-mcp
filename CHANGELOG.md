@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.0
+
+### It no longer insists on Google Chrome specifically
+
+The launcher asked for `channel: 'chrome'` and nothing else, so a machine with Chromium or
+Edge but not Google Chrome failed outright with "Install Google Chrome" — wrong, and
+unhelpful, with a perfectly good browser sitting there. It now tries Chrome, then Edge, then
+Chromium, then a Playwright-managed browser if one is already present, and the error lists
+what it tried. `CHROME_PATH` is still honoured first and, if set, a failure there is an
+error rather than a reason to go hunting.
+
+Nothing is ever downloaded on your behalf. A scan request is not consent to pull 150MB.
+
+### New: run with no browser at all — `SCANNER_API_URL`
+
+Set it and the scan runs on accessibilityscanner.app rather than locally. No account, no
+key: it calls the same public endpoints the website's own form uses. This makes the server
+usable in CI, in containers, and on MCP hosting platforms that have no browser to give it.
+
+Hosted scans additionally return the **nearest passing colour** for contrast failures, so an
+agent gets `change the text to #767676 → 4.54:1` instead of only the ratio that failed. The
+local scanner does not compute that yet.
+
+⚠️ Hosted mode sends the scanned URL to our server. The local path sends nothing anywhere
+and remains the default; this is opt-in via the environment variable only.
+
 ## 0.2.0
 
 ### Scans now load the whole page before testing

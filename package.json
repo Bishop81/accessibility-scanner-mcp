@@ -1,8 +1,8 @@
 {
   "name": "accessibility-scanner-mcp",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "mcpName": "io.github.Bishop81/accessibility-scanner-mcp",
-  "description": "MCP server that scans web pages for WCAG accessibility issues with axe-core, so AI agents can audit and fix accessibility. By accessibilityscanner.app",
+  "description": "MCP server that scans web pages for WCAG accessibility issues with axe-core, so AI agents can audit and fix accessibility. Runs locally with your browser, or serverless via SCANNER_API_URL. By accessibilityscanner.app",
   "type": "module",
   "bin": {
     "accessibility-scanner-mcp": "server.mjs"
