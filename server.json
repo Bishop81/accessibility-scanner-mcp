@@ -1,26 +1,40 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Bishop81/accessibility-scanner-mcp",
-  "description": "Scan any URL for WCAG accessibility issues (axe-core) and get per-element fixes for an AI agent.",
+  "description": "Scan any URL for WCAG accessibility issues (axe-core) and get per-element fixes for an AI agent. Runs locally with your browser, or with no browser via SCANNER_API_URL.",
   "repository": {
     "url": "https://github.com/Bishop81/accessibility-scanner-mcp",
     "source": "github"
   },
-  "version": "0.1.2",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "accessibility-scanner-mcp",
-      "version": "0.1.2",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
           "name": "CHROME_PATH",
-          "description": "Path to a Chrome/Chromium binary, if not auto-detected.",
+          "description": "Path to a Chrome/Chromium/Edge binary. Only needed if auto-detection picks the wrong one.",
           "isRequired": false,
           "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "SCANNER_API_URL",
+          "description": "Set to https://accessibilityscanner.app to run scans on the hosted scanner instead of a local browser. No account needed. Sends the scanned URL to that server.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "SCANNER_API_TOKEN",
+          "description": "Optional API token for higher hosted rate limits. Not required today.",
+          "isRequired": false,
+          "isSecret": true,
           "format": "string"
         }
       ]
