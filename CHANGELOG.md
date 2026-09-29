@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1
+
+### axe-core is pinned exactly
+
+The dependency was `^4.12.1`, so a fresh install picked up 4.13.0 while every one of
+our own checkouts stayed on 4.12.1 — the lockfile pins it for us, and npm ignores a
+lockfile when resolving dependencies for consumers. Anyone installing this package was
+therefore running a different engine from the one we test against and from the hosted
+scanner, and a scan diffed against a hosted report could be comparing two different
+versions of axe without saying so.
+
+Now `4.12.1` exactly. The engine moves when we move it deliberately, the same way the
+scanner revision does. Verified: the pinned build is md5 18449473bb89c2bd026b0cf16971c64e,
+identical to the copy the browser extension vendors.
+
 ## 0.3.0
 
 ### It no longer insists on Google Chrome specifically
